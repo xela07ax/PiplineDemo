@@ -1,127 +1,180 @@
 package main
 
 import (
-	"PiplineConveer/Minions"
 	"PiplineConveer/pipeline"
 	"crypto/md5"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
-	"sync"
 	"time"
 )
 
 // MD5Result структура для передачи результатов
 type MD5Result struct {
-	Path   string
-	Hash   [16]byte
-	Err    error
-	Gopher int
+	PathRoot string
+	Filepath string
+	Hash     [16]byte
+	Err      error
+	Gopher   int
+	Task     int
 }
 
 const PARALLELISM_DEGREE = 10
 
 var ParallelismDegreeResult int
 
-// --- Реализация нод (ProcessorFunc) ---
+const (
+	WALKER    = "Walker"
+	SUMMER    = "Summer"
+	COLLECTOR = "Collector"
+)
 
-// FileWalkerNode рекурсивно обходит директорию и отправляет пути файлов
-func FileWalkerNode(dirPath string) pipeline.ProcessorFunc {
-	return func(in map[string]chan [4]interface{}, out map[string]chan [4]interface{}, wg *sync.WaitGroup) {
-		defer wg.Done()
-		var err error
-		defer func() {
-			out["files"] <- [4]interface{}{"nil", err, true}
-		}()
+func main() {
+	// Начальное время
+	startTime := time.Now()
+	// os.Args[1] — первый аргумент путь к директории
+	// os.Args[2] — второй аргумент количество обработчиков (необязательно)
 
-		err = filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
+	// Проверяем, достаточно ли аргументов
+	// если аргумент число, то это количество рутин
+	ParallelismDegreeResult = PARALLELISM_DEGREE
+	rootDirs := make(map[string]struct{})
+	if len(os.Args) > 1 {
+		for _, arg := range os.Args[1:] {
+			try, err := strconv.Atoi(arg)
 			if err != nil {
-				return err
+				// значит путь к папке
+				rootDirs[arg] = struct{}{}
+			} else {
+				// если получилось преобразовать, значит рутин
+				ParallelismDegreeResult = try
 			}
-			if !info.IsDir() {
-				// Отправляем путь файла в выходной канал
-				out["files"] <- [4]interface{}{MD5Result{path, [16]byte{}, nil, 0}, nil, nil}
-			}
-			return nil
-		})
+		}
+	} else {
+		log.Fatalf("Пожалуйста, предоставьте как минимум один аргумента командной строки. Ожидается путь к папке и количество обработчиков\nПример: go run main.go 4 D:/Downloads/nnm2")
+	}
 
-		if err != nil {
-			err = fmt.Errorf("Ошибка при обходе директории: %v\n", err)
+	// Запускаем пайплайн
+	p := pipeline.NewPipeline()
+
+	// 1. Создаем ноды
+	p.AddNode(WALKER, FileWalkerNode, 2)
+	p.AddNode(SUMMER, MD5SummerNode, ParallelismDegreeResult)
+	p.AddNode(COLLECTOR, CollectorNode, 1)
+
+	log.Printf("Запуск вычисления MD5 хешей с параллелизмом %d...", ParallelismDegreeResult)
+	// 4. Запускаем
+	p.Run()
+
+	// 5. Поставим задачи на выполнение
+	for path := range rootDirs {
+		log.Printf("Директория:%s...", path)
+		p.Inputs[WALKER] <- [2]interface{}{path}
+	}
+	// 6. Ожидаем завершения
+	log.Println("Ожидаем завершения")
+	for a := 1; a <= len(rootDirs); a++ {
+		errMaybe := <-p.Outputs[WALKER]
+		if errMaybe[1] != nil {
+			err, ok := errMaybe[1].(error)
+			if !ok {
+				log.Fatalf("Ошибка данных error в модуле main Walker:%v", errMaybe[1])
+			}
+			log.Printf("Ошибка при выполнении:%v", err)
+			// Экстренно останавливаем все задачи
+			err = p.Kill()
+			log.Printf("Killed output: %v", err)
 		}
 	}
+	log.Println("Все файлы обработаны. Пайплайн завершен.")
+	// Конечное время
+	endTime := time.Now()
+	// Подсчет разницы во времени
+	duration := endTime.Sub(startTime)
+
+	log.Printf("Время выполнения: %s", duration)
+}
+
+// FileWalkerNode рекурсивно обходит директорию и отправляет пути файлов
+func FileWalkerNode(gopher int, dirTask [2]interface{}, inputs, outputs map[string]chan [2]interface{}) {
+	var err error
+	var files []string // сделаем список обрабатываемых файлов
+
+	path, ok := dirTask[0].(string)
+	if !ok {
+		log.Fatalf("Ошибка данных string в модуле pipeline FileWalkerNode:%v", dirTask[0])
+	}
+	err = filepath.Walk(path, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			files = append(files, path)
+		}
+		return nil
+	})
+	if err != nil {
+		dirTask[1] = fmt.Errorf("ошибка при обходе директории: %v", err)
+		outputs[WALKER] <- dirTask
+	}
+	// Создадим ожидащий завершения остальных операций канал
+	waitTempWalkerChannelName := fmt.Sprintf("%s_%s", WALKER, path)
+	outputs[waitTempWalkerChannelName] = make(chan [2]interface{})
+
+	for _, file := range files {
+		inputs[SUMMER] <- [2]interface{}{MD5Result{
+			PathRoot: path,
+			Filepath: file,
+			Task:     gopher,
+		}}
+		// test error
+		//if i == 4 {
+		//	dirTask[1] = fmt.Errorf("123[fake test]ошибка при обходе директории: %v", err)
+		//	outputs[WALKER] <- dirTask
+		//}
+	}
+	// Ждем, пока все файлы будут обработаны
+	// Собираем результаты из канала results
+	for a := 1; a <= len(files); a++ {
+		<-outputs[waitTempWalkerChannelName]
+	}
+	// очистим временный канал
+	delete(outputs, waitTempWalkerChannelName)
+	outputs[WALKER] <- [2]interface{}{path}
 }
 
 // MD5SummerNode вычисляет MD5 хеши параллельно
-func MD5SummerNode(in map[string]chan [4]interface{}, out map[string]chan [4]interface{}, wg *sync.WaitGroup) {
-	defer wg.Done()
-	defer close(out["results"]) // Закрываем выходной канал, когда все хеши посчитаны
-
-	inputFiles := in["files"]
-	results := out["results"]
-
-	// Запускаем воркеры
-	md5conveer := Minions.NewConveer("md5worker", func(gopherNumber int, element interface{}, out chan [4]interface{}) {
-		result, ok := element.(MD5Result)
-		if !ok {
-			panic("Ошибка данных string в модуле Minions")
-		}
-		hash, err := calculateMD5(result.Path)
-		result.Hash = hash
-		result.Gopher = gopherNumber
-		out <- [4]interface{}{result, err}
-	})
-	md5conveer.RunMinions(ParallelismDegreeResult)
-	// Зададим для воркеров выходной канал pipiline-а
-	// Отправляем результат в выходной канал
-	md5conveer.OutputChan = results
-
-	// Используем bounded concurrency (ограничение параллелизма)
-	// Для каждого файла запускаем горутину
-	for filePathFlow := range inputFiles { // 0- данные any MD5Result, 1-ошибка error, 2-завершено bool, 3 - Kill bool
-		if filePathFlow[1] != nil {
-			// ошибка
-			md5conveer.Kill()
-			results <- [4]interface{}{filePathFlow[0], filePathFlow[1], true}
-			return
-		}
-		if filePathFlow[2] != nil {
-			// завершение, все файлы обработаны
-			// Ждем, пока все файлы будут обработаны
-			md5conveer.Stop()
-			return
-		}
-		// отправляем задание напрямую в обработчик
-		md5conveer.InputChan <- filePathFlow[0]
+func MD5SummerNode(gopher int, element [2]interface{}, inputs, outputs map[string]chan [2]interface{}) {
+	pathData, ok := element[0].(MD5Result)
+	if !ok {
+		log.Fatalf("Ошибка данных string в модуле pipeline MD5SummerNode:%v", element[0])
 	}
+	sum, err := calculateMD5(pathData.Filepath)
+	if err != nil {
+		element[1] = fmt.Errorf("ошибка обработки файла %s: %v", pathData.Filepath, err)
+		outputs[WALKER] <- element
+		// Обратите внимание, при ошибке мы не отправляем отчет в Walker и он ожидая окончания зависнет навсегда!
+		return
+	}
+	// Отправляем на обработку в коллектор для вывода результата в консоль
+	pathData.Hash = sum
+	pathData.Gopher = gopher
+	element[0] = pathData
+	inputs[COLLECTOR] <- element
 }
 
-// CollectorNode собирает результаты и печатает их
-func CollectorNode(in map[string]chan [4]interface{}, out map[string]chan [4]interface{}, wg *sync.WaitGroup) {
-	defer wg.Done()
-	// У этой ноды нет выходов, только вход "results"
-
-	for resultFlow := range in["results"] { // 0- данные any, 1-ошибка error, 2-завершено bool, 3 - Kill bool
-		if resultFlow[1] != nil {
-			// ошибка
-			fmt.Printf("Ошибка обработки %v: %v\n", resultFlow[0], resultFlow[1])
-			return
-		}
-		md5res, ok := resultFlow[0].(MD5Result)
-		if !ok {
-			panic("Ошибка данных MD5Result в модуле pipeline CollectorNode")
-		}
-		if md5res.Err != nil {
-			fmt.Printf("Ошибка обработки файла %s: %v\n", md5res.Path, md5res.Err)
-		} else {
-			fmt.Printf("%d|%x  %s\n", md5res.Gopher, md5res.Hash, md5res.Path)
-		}
-		if resultFlow[2] != nil {
-			// завершено успешно
-			return
-		}
+// CollectorNode печатает результаты
+func CollectorNode(gopher int, element [2]interface{}, inputs, outputs map[string]chan [2]interface{}) {
+	md5Data, ok := element[0].(MD5Result)
+	if !ok {
+		log.Fatalf("Ошибка данных string в модуле MD5Result CollectorNode:%v", element[0])
 	}
+	fmt.Printf("TaskRoutine:%d|RoutineMd5:%d|%x  %s\n", md5Data.Task, md5Data.Gopher, md5Data.Hash, md5Data.Filepath)
+	// Надо обо всех успешных операциях оповещать Walker, что бы корректно завершить работу
+	outputs[fmt.Sprintf("%s_%s", WALKER, md5Data.PathRoot)] <- element
 }
 
 // calculateMD5 — вспомогательная функция для вычисления хеша файла
@@ -140,81 +193,4 @@ func calculateMD5(filePath string) ([16]byte, error) {
 	var result [16]byte
 	copy(result[:], hash.Sum(nil))
 	return result, nil
-}
-
-// --- Точка входа ---
-
-func main() {
-	// Начальное время
-	startTime := time.Now()
-	// os.Args[1] — первый аргумент путь к директории
-	// os.Args[2] — второй аргумент количество обработчиков (необязательно)
-
-	// Проверяем, достаточно ли аргументов
-	var err error
-	if len(os.Args) > 2 {
-		ParallelismDegreeResult, err = strconv.Atoi(os.Args[2])
-		if err != nil {
-			panic(fmt.Errorf("Неверный второй аргумент, ожидаем число %v\n", err))
-		}
-	} else if len(os.Args) > 1 {
-		ParallelismDegreeResult = PARALLELISM_DEGREE
-	} else {
-		panic("\"Пожалуйста, предоставьте как минимум один аргумента командной строки. Ожидается путь к папке и количество обработчиков\"\n\"Пример: go run main.go D:/Downloads/nnm2 4\"")
-	}
-
-	rootDir := os.Args[1]
-
-	p := pipeline.NewPipeline()
-
-	// 1. Создаем ноды
-	walker := pipeline.NewNode(
-		"Walker",
-		FileWalkerNode(rootDir),
-		[]string{},        // Нет входов
-		[]string{"files"}, // Один выходной порт "files"
-	)
-
-	summer := pipeline.NewNode(
-		"Summer",
-		MD5SummerNode,
-		[]string{"files"},   // Один входной порт "files"
-		[]string{"results"}, // Один выходной порт "results"
-	)
-
-	collector := pipeline.NewNode(
-		"Collector",
-		CollectorNode,
-		[]string{"results"}, // Один входной порт "results"
-		[]string{},          // Нет выходов
-	)
-
-	// 2. Добавляем ноды в пайплайн
-	p.AddNode(walker)
-	p.AddNode(summer)
-	p.AddNode(collector)
-
-	// 3. Соединяем ноды, формируя граф
-	// Output "files" Walker'а -> Input "files" Summer'а
-	if err := p.Connect(walker, summer, "files", "files"); err != nil {
-		panic(err)
-	}
-	// Output "results" Summer'а -> Input "results" Collector'а
-	if err := p.Connect(summer, collector, "results", "results"); err != nil {
-		panic(err)
-	}
-
-	fmt.Printf("Запуск вычисления MD5 хешей в %s с параллелизмом %d...\n", rootDir, ParallelismDegreeResult)
-
-	// 4. Запускаем и ждем завершения
-	p.Run()
-	p.Wait()
-
-	fmt.Println("Все файлы обработаны. Пайплайн завершен.")
-	// Конечное время
-	endTime := time.Now()
-	// Подсчет разницы во времени
-	duration := endTime.Sub(startTime)
-
-	fmt.Printf("Время выполнения: %s\n", duration)
 }
