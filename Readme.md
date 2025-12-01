@@ -12,8 +12,7 @@
 
 ### Структура проекта
 Схема диаграмма ***Pipline conveer***
-![Схема диаграмма Pipline conveer](./diagram_pipline.jpg)  
-<img src="./diagram_pipline.jpg" width="550" />  
+![Схема диаграмма Pipline conveer](./diagram_pipline.jpg)
 
 #### Дополнительно
 В коде есть закомментированный пример эмуляции вызова ошибки (строка 135, раскомментировать, заменить "_"->"i")
