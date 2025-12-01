@@ -3,7 +3,7 @@ package pipeline
 const BUFFER_VALUE = 100
 
 // Зададим абстрактную модель для данных [2]interface{}
-// 1[0]- данные any, 2[1]-ошибка error, 3[2]-завершено bool, 4[3] - Kill bool
+// 1[0]- данные any, 2[1]-ошибка error
 
 // ProcessorFunc определяет логику обработки ноды.
 // Она принимает карту входных каналов и карту выходных каналов.
@@ -72,12 +72,20 @@ func (p *Pipeline) Stop() {
 
 func (p *Pipeline) Kill() error {
 	var errorsSlice []error
+	resultChan := make(chan struct{})
 	for _, node := range p.nodes {
-		// Бросаем горутины сборщику
-		errRoutine := node.Conveers.Kill()
-		if errRoutine != nil {
-			errorsSlice = append(errorsSlice, errRoutine)
-		}
+		// Бросаем канал данных сборщику
+		go func(n *Node) {
+			errRoutine := n.Conveers.Kill()
+			if errRoutine != nil {
+				errorsSlice = append(errorsSlice, errRoutine)
+			}
+			resultChan <- struct{}{}
+		}(node)
+	}
+	// Сбор результатов из канала results
+	for a := 1; a <= len(p.nodes); a++ {
+		<-resultChan
 	}
 	return combineErrors(errorsSlice)
 }

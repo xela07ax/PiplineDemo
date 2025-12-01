@@ -87,6 +87,7 @@ func main() {
 			// Экстренно останавливаем все задачи
 			err = p.Kill()
 			log.Printf("Killed output: %v", err)
+			break
 		}
 	}
 	log.Println("Все файлы обработаны. Пайплайн завершен.")
@@ -130,9 +131,10 @@ func FileWalkerNode(gopher int, dirTask [2]interface{}, inputs, outputs map[stri
 			Filepath: file,
 			Task:     gopher,
 		}}
-		// test error
-		//if i == 4 {
-		//	dirTask[1] = fmt.Errorf("123[fake test]ошибка при обходе директории: %v", err)
+		// Можно протестировать ошибку
+		//if i == 10 {
+		//	time.Sleep(1 * time.Second)
+		//	dirTask[1] = fmt.Errorf("-!!!-->[fake test]ошибка при обходе директории: %v", err)
 		//	outputs[WALKER] <- dirTask
 		//}
 	}

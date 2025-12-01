@@ -33,7 +33,7 @@ func combineErrors(errorsSlice []error) (err error) {
 	for i := range errorsSlice {
 		errorStrings[i] = errorsSlice[i].Error()
 	}
-	errTxt := strings.Join(errorStrings, "\n")
+	errTxt := strings.Join(errorStrings, "")
 	return errors.New(errTxt)
 }
 
@@ -137,11 +137,13 @@ func (m *Conveer) circle(gopher int) {
 	for {
 		select {
 		case element := <-m.InputChan:
+			// Исполнение функции может зависнуть, что помешает завершению, можно изменить на код ниже
+			// // вынести наверх для оптимизации*
 			go func() {
 				m.ProcessFunc(gopher, element, m.Inputs, m.Outputs)
 				resultChan <- struct{}{}
 			}()
-			// Исполнение функции может зависнуть, что помешает завершению
+
 			select {
 			case <-resultChan:
 			case <-m.kill:
